@@ -10,6 +10,8 @@
 #include <direct.h>
 #include <io.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "port/fs.h"
@@ -119,21 +121,62 @@ int fs_commit(int fd) { return _commit(fd) == 0; }
 int fs_replace(const char *tmp, const char *dst) { return MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0; }
 int fs_safe_saves(void) { return mods_get_int("fixes.safe_saves", 1); }
 
+static int save_newest_first(const void *left, const void *right) {
+  const WIN32_FIND_DATAA *a = left, *b = right;
+  int t = CompareFileTime(&a->ftLastWriteTime, &b->ftLastWriteTime);
+  if (t) return -t;
+  int name = _stricmp(a->cFileName, b->cFileName);
+  return name ? name : strcmp(a->cFileName, b->cFileName);
+}
+
+static void list_emit(fs_list_fn fn, void *ctx, const WIN32_FIND_DATAA *fd) {
+  fn(ctx, fd->cFileName, (fd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, fd->nFileSizeLow);
+}
+
 int fs_list(const char *dospattern, fs_list_fn fn, void *ctx) {
   char rel[512], pat[600];
   if (!fn || !normalize(dospattern, rel, sizeof rel)) return 0;
   if (has_parent_part(rel)) return 0;
   int len = snprintf(pat, sizeof pat, "%s/%s", base_for(rel), rel);
   if (len < 0 || len >= (int)sizeof pat) return 0;
-  WIN32_FIND_DATAA fd;
+  // The game's load menu uses this exact pattern. Feed both its own list and
+  // the remastered front end the same newest-first order.
+  int newest_first = !_stricmp(rel, "Saved Games/*.sve");
+  WIN32_FIND_DATAA fd, *saved = NULL;
+  size_t used = 0, cap = 0;
   HANDLE h = FindFirstFileA(pat, &fd);
   if (h == INVALID_HANDLE_VALUE) return 0;
   int n = 0;
   do {
     if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
-    fn(ctx, fd.cFileName, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, fd.nFileSizeLow);
+    if (newest_first) {
+      if (used == cap) {
+        size_t next = cap ? cap * 2 : 32;
+        WIN32_FIND_DATAA *grown = next > cap && next <= SIZE_MAX / sizeof *saved
+          ? realloc(saved, next * sizeof *saved) : NULL;
+        if (grown) saved = grown, cap = next;
+        else {
+          // Low memory: emit the buffered names in their original order,
+          // then stream the rest, without hiding any player's saves.
+          for (size_t i = 0; i < used; i++) list_emit(fn, ctx, &saved[i]);
+          free(saved); saved = NULL;
+          newest_first = 0;
+        }
+      }
+      if (newest_first) {
+        saved[used++] = fd;
+        n++;
+        continue;
+      }
+    }
+    list_emit(fn, ctx, &fd);
     n++;
   } while (FindNextFileA(h, &fd));
   FindClose(h);
+  if (newest_first) {
+    qsort(saved, used, sizeof *saved, save_newest_first);
+    for (size_t i = 0; i < used; i++) list_emit(fn, ctx, &saved[i]);
+  }
+  free(saved);
   return n;
 }
