@@ -1489,6 +1489,7 @@ static int snap_begin(Snap *s, uint32_t dst, int x, int y, double fw, double fh)
   s->rx = x0, s->ry = y0, s->rw = x1 - x0, s->rh = y1 - y0;
   if (s->rw <= 0 || s->rh <= 0) return 0;
   s->before = malloc((size_t)s->rw * s->rh * 2);
+  if (!s->before) return 0;  // the original sprite draw remains visible
   const uint16_t *src = (const uint16_t *)(uintptr_t)s->base;
   for (int j = 0; j < s->rh; j++) memcpy(s->before + j * s->rw, src + (size_t)(s->ry + j) * s->pitch + s->rx, (size_t)s->rw * 2);
   return 1;
@@ -1497,9 +1498,15 @@ static int snap_begin(Snap *s, uint32_t dst, int x, int y, double fw, double fh)
 // After the draw: the changed pixels become entry e's; asks for its textures.
 static void snap_end(Snap *s, Entry *e, const uint16_t *pal, const uint16_t *lev) {
   List *L = &g_rec;
-  if (L->n == L->cap) L->e = realloc(L->e, (L->cap = L->cap ? L->cap * 2 : 1024) * sizeof(Entry));
   int idx = L->n;
   if (idx >= 0xfffe) return;
+  if (L->n == L->cap) {
+    int cap = L->cap ? L->cap * 2 : 1024;
+    Entry *grown = realloc(L->e, (size_t)cap * sizeof *grown);
+    if (!grown) return;  // keep the prior list; the original draw remains visible
+    L->e = grown;
+    L->cap = cap;
+  }
   const uint16_t *now = (const uint16_t *)(uintptr_t)s->base;
   int owned = 0;
   for (int j = 0; j < s->rh; j++) {
