@@ -1489,6 +1489,7 @@ static int snap_begin(Snap *s, uint32_t dst, int x, int y, double fw, double fh)
   s->rx = x0, s->ry = y0, s->rw = x1 - x0, s->rh = y1 - y0;
   if (s->rw <= 0 || s->rh <= 0) return 0;
   s->before = malloc((size_t)s->rw * s->rh * 2);
+  if (!s->before) return 0;  // the original sprite draw remains visible
   const uint16_t *src = (const uint16_t *)(uintptr_t)s->base;
   for (int j = 0; j < s->rh; j++) memcpy(s->before + j * s->rw, src + (size_t)(s->ry + j) * s->pitch + s->rx, (size_t)s->rw * 2);
   return 1;
@@ -1497,9 +1498,15 @@ static int snap_begin(Snap *s, uint32_t dst, int x, int y, double fw, double fh)
 // After the draw: the changed pixels become entry e's; asks for its textures.
 static void snap_end(Snap *s, Entry *e, const uint16_t *pal, const uint16_t *lev) {
   List *L = &g_rec;
-  if (L->n == L->cap) L->e = realloc(L->e, (L->cap = L->cap ? L->cap * 2 : 1024) * sizeof(Entry));
   int idx = L->n;
   if (idx >= 0xfffe) return;
+  if (L->n == L->cap) {
+    int cap = L->cap ? L->cap * 2 : 1024;
+    Entry *grown = realloc(L->e, (size_t)cap * sizeof *grown);
+    if (!grown) return;  // keep the prior list; the original draw remains visible
+    L->e = grown;
+    L->cap = cap;
+  }
   const uint16_t *now = (const uint16_t *)(uintptr_t)s->base;
   int owned = 0;
   for (int j = 0; j < s->rh; j++) {
@@ -2281,9 +2288,19 @@ typedef struct {
 #define TEX_N (1 << 16)
 static Tex *g_tex;   // open addressing, render thread; slots stay used after eviction (tombstones)
 static int g_ntex, g_tex_slots;
+static Tex **g_evict_order;   // reused scratch, oldest resident textures first
 static int g_recover_cursor = TEX_N;
 static size_t g_tex_bytes, g_tex_peak;
 static uint32_t g_tick;
+// Render-thread-only, opt-in cache diagnosis for large courses.
+typedef struct { unsigned uploads, evictions; size_t uploaded_bytes; double upload_ms; } CacheCatStat;
+static CacheCatStat g_cache_cat[NCAT + 1];
+static int g_cache_profile;
+static int cache_category(Key key) {
+  unsigned file = key.a >> 16;
+  int cat = file < (unsigned)g_nfiles ? g_files[file].cat : -1;
+  return cat >= 0 && cat < NCAT ? cat : NCAT;
+}
 static List g_cur[2];   // the lists being shown
 static int g_cur_ok[2];
 static uint8_t *g_cut[2];
@@ -2411,32 +2428,57 @@ static Tex *tex_find(Key k, int make) {
 // Drops the tombstones when the table gets full.
 static void tex_rehash(void) {
   if (g_tex_slots < TEX_N * 3 / 4 || g_recover_cursor<TEX_N) return;
+  Tex *fresh = calloc(TEX_N, sizeof(Tex));
+  if (!fresh) return;   // keep the original table when memory is tight
   Tex *old = g_tex;
-  g_tex = calloc(TEX_N, sizeof(Tex));
+  g_tex = fresh;
   g_tex_slots = 0;
   for (int i = 0; i < TEX_N; i++)
     if (old[i].tex || old[i].request) *tex_find(old[i].key, 1) = old[i];
   free(old);
 }
 
+static void tex_drop(Tex *old) {
+  if (g_cache_profile) g_cache_cat[cache_category(old->key)].evictions++;
+  SDL_DestroyTexture(old->tex);
+  if(old->emissive)SDL_DestroyTexture(old->emissive);
+  g_tex_bytes -= (size_t)old->w * old->h * (old->emissive?8:4);
+  old->emissive=NULL;
+  g_ntex--;
+  EnterCriticalSection(&g_lock);
+  KeyState *s = ks_find(old->key, 0);
+  if (s) s->state = S_NONE;
+  LeaveCriticalSection(&g_lock);
+  free(old->request);old->request=NULL;
+  old->tex = NULL;   // the key stays as a tombstone so probing goes on past it
+}
+
+static int tex_oldest_first(const void *a, const void *b) {
+  const Tex *x = *(Tex *const *)a, *y = *(Tex *const *)b;
+  if (x->used != y->used) return x->used < y->used ? -1 : 1;
+  // The old scan picked the first slot on equal timestamps.
+  return x == y ? 0 : x < y ? -1 : 1;
+}
+
 static void tex_evict(void) {
   size_t budget = (size_t)texture_budget_mb() << 20;
+  if (g_tex_bytes <= budget || g_ntex <= 0) return;
+  if (!g_evict_order) g_evict_order = malloc((size_t)TEX_N * sizeof *g_evict_order);
+  if (g_evict_order) {
+    int n = 0;
+    for (int i = 0; i < TEX_N; i++)
+      if (g_tex[i].tex && g_tex[i].used + 2 < g_tick) g_evict_order[n++] = &g_tex[i];
+    qsort(g_evict_order, (size_t)n, sizeof *g_evict_order, tex_oldest_first);
+    for (int i = 0; i < n && g_tex_bytes > budget; i++) tex_drop(g_evict_order[i]);
+    return;
+  }
+  // Low-memory fallback: keep the original selection path.
   while (g_tex_bytes > budget && g_ntex > 0) {
-    Tex *old = NULL;   // the least recently used
+    Tex *old = NULL;
     for (int i = 0; i < TEX_N; i++)
       if (g_tex[i].tex && (!old || g_tex[i].used < old->used)) old = &g_tex[i];
-    if (!old || old->used + 2 >= g_tick) break;   // all in use right now
-    SDL_DestroyTexture(old->tex);
-    if(old->emissive)SDL_DestroyTexture(old->emissive);
-    g_tex_bytes -= (size_t)old->w * old->h * (old->emissive?8:4);
-    old->emissive=NULL;
-    g_ntex--;
-    EnterCriticalSection(&g_lock);
-    KeyState *s = ks_find(old->key, 0);
-    if (s) s->state = S_NONE;
-    LeaveCriticalSection(&g_lock);
-    free(old->request);old->request=NULL;
-    old->tex = NULL;   // the key stays as a tombstone so probing goes on past it
+    if (!old || old->used + 2 >= g_tick) break;
+    tex_drop(old);
   }
 }
 
@@ -2485,7 +2527,8 @@ static int upload_done(SDL_Renderer *r) {
     double prof_t = host_now_ms();
     SDL_Texture *t = d.rgba ? SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, d.w, d.h) : NULL;
     if (t && SDL_UpdateTexture(t, NULL, d.rgba, d.w * 4) != 0) { SDL_DestroyTexture(t); t = NULL; }
-    prof_gpu += host_now_ms() - prof_t; prof_n++; prof_bytes += (size_t)d.w * d.h * 4;
+    double gpu_ms = host_now_ms() - prof_t;
+    prof_gpu += gpu_ms; prof_n++; prof_bytes += (size_t)d.w * d.h * 4;
     if (t) {
       SDL_SetTextureBlendMode(t, (d.key.b >> 28) == V_MASKED ? g_premul : SDL_BLENDMODE_BLEND);
       SDL_SetTextureScaleMode(t, SDL_ScaleModeLinear);
@@ -2511,7 +2554,14 @@ static int upload_done(SDL_Renderer *r) {
         x->h = d.h;
         x->used = g_tick;
         g_ntex++;
-        g_tex_bytes += (size_t)d.w * d.h * (x->emissive?8:4);
+        size_t texture_bytes = (size_t)d.w * d.h * (x->emissive?8:4);
+        g_tex_bytes += texture_bytes;
+        if (g_cache_profile) {
+          CacheCatStat *s = &g_cache_cat[cache_category(d.key)];
+          s->uploads++;
+          s->uploaded_bytes += texture_bytes;
+          s->upload_ms += gpu_ms;
+        }
         if (g_tex_bytes > g_tex_peak) g_tex_peak = g_tex_bytes;
       } else {
         SDL_DestroyTexture(t);
@@ -2985,11 +3035,28 @@ void hd_art_draw(int which, SDL_Renderer *r, double ox, double oy, double k) {
   g_rstat.ms += host_now_ms() - t0;
   static double last;
   double now = host_now_ms();
-  if (g_log && now - last > 5000) {
-    if (last > 0 && g_rstat.frames)
+  if ((g_log || g_cache_profile) && now - last > 5000) {
+    if (g_log && last > 0 && g_rstat.frames)
       fprintf(stderr, "art: render %d frames, %.1f entries/frame, %.1f drawn/frame, %.3f ms/frame drawing; %d textures %.1f MB (peak %.1f MB)\n",
               g_rstat.frames, (double)g_rstat.entries / g_rstat.frames, (double)g_rstat.drawn / g_rstat.frames,
               g_rstat.ms / g_rstat.frames, g_ntex, g_tex_bytes / 1048576.0, g_tex_peak / 1048576.0);
+    if (g_cache_profile) {
+      size_t resident[NCAT + 1] = {0};
+      unsigned textures[NCAT + 1] = {0};
+      for (int i = 0; i < TEX_N; i++) if (g_tex[i].tex) {
+        int cat = cache_category(g_tex[i].key);
+        resident[cat] += (size_t)g_tex[i].w * g_tex[i].h * (g_tex[i].emissive ? 8 : 4);
+        textures[cat]++;
+      }
+      for (int i = 0; i <= NCAT; i++) {
+        CacheCatStat *s = &g_cache_cat[i];
+        if (!textures[i] && !s->uploads && !s->evictions) continue;
+        fprintf(stderr, "art-cache: %s resident %u textures %.1f MB; 5s uploads %u %.1f MB %.1f ms, evictions %u\n",
+                i < NCAT ? k_cat[i] : "other", textures[i], resident[i] / 1048576.0,
+                s->uploads, s->uploaded_bytes / 1048576.0, s->upload_ms, s->evictions);
+      }
+      memset(g_cache_cat, 0, sizeof g_cache_cat);
+    }
     memset(&g_rstat, 0, sizeof g_rstat);
     last = now;
   }
@@ -2999,6 +3066,7 @@ void hd_art_draw(int which, SDL_Renderer *r, double ox, double oy, double k) {
 
 void hd_art_init(int presenter_on) {
   g_on = 0;
+  g_cache_profile = getenv("SIMGOLF_ART_CACHE_PROFILE") != NULL;
   g_path_styles_enabled = mods_get_int("art.path_styles",1);
   update_any();
   if (!g_pack) {
